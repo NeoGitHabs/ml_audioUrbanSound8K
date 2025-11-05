@@ -1,59 +1,54 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from torchvision import transforms
-import torchaudio.transforms as T
 import streamlit as st
-from PIL import Image
 import torch.nn as nn
 import torchaudio
-import librosa
-import numpy as np
-import uvicorn
-import tempfile
+import torch.nn.functional as F
 import torch
-import io
+import tempfile
+import soundfile as sf
 import os
 
+# Классы Urban Sound 8K
+classes = ['air_conditioner', 'car_horn', 'children_playing', 'dog_bark', 'drilling',
+           'engine_idling', 'gun_shot', 'jackhammer', 'siren', 'street_music']
 
-classes = ['blues', 'classical', 'country', 'disco', 'hiphop', 'jazz', 'metal', 'pop', 'reggae', 'rock']
+# Параметры из notebook
+SAMPLE_RATE = 22050
+N_MELS = 64
+MAX_LEN = 500
 
-transform = T.MelSpectrogram(
-     sample_rate = 22050,
-     n_mels = 64
-)
+transform = torchaudio.transforms.MelSpectrogram(sample_rate=SAMPLE_RATE, n_mels=N_MELS)
 
-class CheckAudio(nn.Module):
-    def __init__(self):
+
+class UrbanAudio(nn.Module):
+    def __init__(self, num_classes=10):
         super().__init__()
-        self.first = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
             nn.AdaptiveAvgPool2d((8, 8))
         )
-        self.second = nn.Sequential(
+        self.fc = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 128),
-            nn.ReLU(),
-            nn.Linear(128, 10)
+            nn.Linear(64 * 8 * 8, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, num_classes)
         )
 
-    def forward(self, audio):
-        audio = audio.unsqueeze(1)
-        audio = self.first(audio)
-        audio = self.second(audio)
-        return audio
+    def forward(self, x):
+        return self.fc(self.conv(x))
 
+
+# Загрузка модели
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = CheckAudio()
-model.load_state_dict(torch.load('audioGTZAN.pth', map_location=device))
+model = UrbanAudio()
+model.load_state_dict(torch.load('audioUrbanSound8K.pth', map_location=device))
 model.to(device)
 model.eval()
 
-st.title('Audio Genre Classifier')
-st.text('Загрузите аудио, и модель попробует её распознать.')
+st.title('Audio Urban Sound 8K')
+st.text('Загрузите аудио, и модель попробует его распознать.')
 
 mnist_audio = st.file_uploader('Выберите аудио', type=['wav', 'mp3', 'flac', 'ogg'])
 
@@ -68,45 +63,35 @@ else:
                 tmp_file.write(mnist_audio.read())
                 tmp_path = tmp_file.name
 
-            waveform, sample_rate = librosa.load(tmp_path, sr=22050)
-            waveform = torch.from_numpy(waveform).unsqueeze(0)
+            # Загрузка через soundfile
+            waveform, sr = sf.read(tmp_path)
+            waveform = torch.from_numpy(waveform).float()
+
+            # Преобразование в формат [channels, samples]
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            else:
+                waveform = waveform.T
+
             os.unlink(tmp_path)
 
-            mel_spec = transform(waveform)
-            mel_spec = mel_spec.mean(dim=0) if mel_spec.dim() == 3 else mel_spec
-            mel_spec = mel_spec.unsqueeze(0).to(device)
+            # Моно + ресемплинг
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            if sr != SAMPLE_RATE:
+                resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=SAMPLE_RATE)
+                waveform = resampler(waveform)
+
+            # Спектрограмма + паддинг
+            spec = transform(waveform)
+            spec = spec[..., :MAX_LEN] if spec.shape[-1] > MAX_LEN else F.pad(spec, (0, MAX_LEN - spec.shape[-1]))
+            spec = spec.unsqueeze(0).to(device)
 
             with torch.no_grad():
-                y_prediction = model(mel_spec)
+                y_prediction = model(spec)
                 prediction = y_prediction.argmax(dim=1).item()
 
             st.success(f'Модель думает, что это: {classes[prediction]}')
 
         except Exception as e:
             st.error(f'Ошибка: {str(e)}')
-
-
-
-
-# app = FastAPI()
-#
-# @app.post('/predict')
-# async def check_image(file:UploadFile = File(...)):
-#     try:
-#         data = await file.read()
-#         if not data:
-#             raise HTTPException(status_code=400, detail='File not Found')
-#
-#         img = Image.open(io.BytesIO(data))
-#         img_tensor = transform(img).unsqueeze(0).to(device)
-#
-#         with torch.no_grad():
-#             prediction = model(img_tensor)
-#             result = prediction.argmax(dim=1).item()
-#             return {f'class': classes[result]}
-#
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f'{e}')
-#
-# if __name__ == '__main__':
-#     uvicorn.run(app, host='127.0.0.1', port=8000)
