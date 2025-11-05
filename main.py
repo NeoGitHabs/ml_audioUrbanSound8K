@@ -1,156 +1,112 @@
-import warnings
-
-warnings.filterwarnings('ignore')
-
 from fastapi import FastAPI, HTTPException, UploadFile, File
-import uvicorn
-import torch
+from torchvision import transforms
+import torchaudio.transforms as T
+import streamlit as st
+from PIL import Image
 import torch.nn as nn
-import torch.nn.functional as F
 import torchaudio
+import librosa
+import numpy as np
+import uvicorn
+import tempfile
+import torch
 import io
-import soundfile as sf
-
-# Конфигурация
-SAMPLE_RATE = 22050
-N_MELS = 64
-MAX_LEN = 1500
-MIN_AUDIO_LENGTH = 1000
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-app = FastAPI(title="Urban Sound Classifier")
+import os
 
 
-# Модель
-class UrbanAudio(nn.Module):
-    def __init__(self, num_classes=10):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.AdaptiveAvgPool2d((8, 8))
-        )
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 128), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, num_classes)
-        )
+classes = ['blues', 'classical', 'country', 'disco', 'hiphop', 'jazz', 'metal', 'pop', 'reggae', 'rock']
 
-    def forward(self, x):
-        return self.fc(self.conv(x))
-
-
-# Загрузка модели
-print("Загрузка модели...")
-model = UrbanAudio().to(DEVICE)
-model.load_state_dict(torch.load('urban_model.pth', map_location=DEVICE, weights_only=True))
-model.eval()
-
-# Загрузка меток
-try:
-    labels = torch.load('urban_labels.pth', map_location='cpu', weights_only=False)
-    if isinstance(labels, torch.Tensor):
-        labels = labels.tolist()
-    labels = [str(l) for l in labels]
-    print(f"Метки загружены из файла: {labels}")
-except Exception as e:
-    print(f"Ошибка загрузки меток: {e}")
-    # Стандартные метки UrbanSound8K по порядку classID
-    labels = [
-        'air_conditioner', 'car_horn', 'children_playing', 'dog_bark',
-        'drilling', 'engine_idling', 'gun_shot', 'jackhammer',
-        'siren', 'street_music'
-    ]
-    print(f"Используются стандартные метки: {labels}")
-
-print(f"Модель загружена. Классов: {len(labels)}")
-
-# Трансформации
-transform = nn.Sequential(
-    torchaudio.transforms.MelSpectrogram(sample_rate=SAMPLE_RATE, n_mels=N_MELS),
-    torchaudio.transforms.AmplitudeToDB()
+transform = T.MelSpectrogram(
+     sample_rate = 22050,
+     n_mels = 64
 )
 
+class CheckAudio(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.AdaptiveAvgPool2d((8, 8))
+        )
+        self.second = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 8 * 8, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)
+        )
 
-def preprocess_audio(waveform: torch.Tensor, sr: int) -> torch.Tensor:
-    """Предобработка аудио"""
-    if waveform.ndim > 1:
-        waveform = waveform.mean(dim=0)
+    def forward(self, audio):
+        audio = audio.unsqueeze(1)
+        audio = self.first(audio)
+        audio = self.second(audio)
+        return audio
 
-    if waveform.numel() == 0:
-        raise ValueError("Аудиофайл пустой")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = CheckAudio()
+model.load_state_dict(torch.load('audioGTZAN.pth', map_location=device))
+model.to(device)
+model.eval()
 
-    if len(waveform) < MIN_AUDIO_LENGTH:
-        waveform = F.pad(waveform, (0, MIN_AUDIO_LENGTH - len(waveform)))
+st.title('Audio Genre Classifier')
+st.text('Загрузите аудио, и модель попробует её распознать.')
 
-    if sr != SAMPLE_RATE:
-        resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
-        waveform = resampler(waveform.unsqueeze(0)).squeeze(0)
+mnist_audio = st.file_uploader('Выберите аудио', type=['wav', 'mp3', 'flac', 'ogg'])
 
-    spec = transform(waveform.unsqueeze(0)).squeeze(0)
+if not mnist_audio:
+    st.info('Загрузите аудио')
+else:
+    st.audio(mnist_audio)
 
-    if spec.shape[1] > MAX_LEN:
-        spec = spec[:, :MAX_LEN]
-    elif spec.shape[1] < MAX_LEN:
-        spec = F.pad(spec, (0, MAX_LEN - spec.shape[1]))
+    if st.button('Распознать'):
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+                tmp_file.write(mnist_audio.read())
+                tmp_path = tmp_file.name
 
-    return spec.unsqueeze(0).unsqueeze(0)
+            waveform, sample_rate = librosa.load(tmp_path, sr=22050)
+            waveform = torch.from_numpy(waveform).unsqueeze(0)
+            os.unlink(tmp_path)
 
+            mel_spec = transform(waveform)
+            mel_spec = mel_spec.mean(dim=0) if mel_spec.dim() == 3 else mel_spec
+            mel_spec = mel_spec.unsqueeze(0).to(device)
 
-@app.post('/predict/')
-async def predict(file: UploadFile = File(...)):
-    """Предсказание класса аудио"""
-    try:
-        data = await file.read()
-        if not data:
-            raise HTTPException(status_code=400, detail='Пустой файл')
+            with torch.no_grad():
+                y_prediction = model(mel_spec)
+                prediction = y_prediction.argmax(dim=1).item()
 
-        waveform, sr = sf.read(io.BytesIO(data), dtype='float32')
-        waveform = torch.tensor(waveform, dtype=torch.float32)
+            st.success(f'Модель думает, что это: {classes[prediction]}')
 
-        spec = preprocess_audio(waveform, sr).to(DEVICE)
-
-        with torch.no_grad():
-            logits = model(spec)
-            pred_idx = logits.argmax(dim=1).item()
-            confidence = torch.softmax(logits, dim=1)[0, pred_idx].item()
-
-        if pred_idx >= len(labels):
-            raise ValueError(f"Индекс {pred_idx} вне диапазона (доступно {len(labels)} классов)")
-
-        label = labels[pred_idx]
-
-        return {
-            "index": pred_idx,
-            "sound": label,
-            "confidence": round(confidence, 4),
-            "all_scores": {labels[i]: round(torch.softmax(logits, dim=1)[0, i].item(), 4)
-                           for i in range(len(labels))}
-        }
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
-
-
-@app.get('/')
-async def root():
-    return {
-        "message": "Urban Sound Classifier API",
-        "endpoint": "/predict/",
-        "classes": labels,
-        "num_classes": len(labels)
-    }
+        except Exception as e:
+            st.error(f'Ошибка: {str(e)}')
 
 
-@app.get('/health')
-async def health():
-    return {"status": "ok", "device": str(DEVICE), "num_classes": len(labels)}
 
 
-if __name__ == '__main__':
-    print(f"Документация: http://127.0.0.1:8000/docs")
-    uvicorn.run(app, host='127.0.0.1', port=8000)
+# app = FastAPI()
+#
+# @app.post('/predict')
+# async def check_image(file:UploadFile = File(...)):
+#     try:
+#         data = await file.read()
+#         if not data:
+#             raise HTTPException(status_code=400, detail='File not Found')
+#
+#         img = Image.open(io.BytesIO(data))
+#         img_tensor = transform(img).unsqueeze(0).to(device)
+#
+#         with torch.no_grad():
+#             prediction = model(img_tensor)
+#             result = prediction.argmax(dim=1).item()
+#             return {f'class': classes[result]}
+#
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f'{e}')
+#
+# if __name__ == '__main__':
+#     uvicorn.run(app, host='127.0.0.1', port=8000)
